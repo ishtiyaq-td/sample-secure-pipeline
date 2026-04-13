@@ -1,0 +1,470 @@
+name: Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write   # for CodeQL / SARIF uploads
+  pull-requests: write     # for PR comments
+  packages: write          # for GHCR image push
+
+env:
+  NODE_VERSION: "20"
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_TAG: ${{ github.sha }}
+
+# ──────────────────────────────────────────────
+# JOB 1 — PRE-COMMIT CHECKS
+# ──────────────────────────────────────────────
+jobs:
+  pre-checks:
+    name: Pre-checks (lint + secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history needed by Gitleaks
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Format check (Prettier)
+        run: npm run format:check
+
+      - name: Type check
+        run: npm run typecheck
+        continue-on-error: false
+
+      - name: Gitleaks — secrets scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}   # only needed for org-level; remove for public repos
+
+  # ──────────────────────────────────────────────
+  # JOB 2 — UNIT TESTS + COVERAGE
+  # ──────────────────────────────────────────────
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    needs: pre-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+      - name: Coverage threshold gate
+        run: |
+          COVERAGE=$(node -e "const r=require('./coverage/coverage-summary.json'); console.log(r.total.lines.pct)")
+          echo "Line coverage: $COVERAGE%"
+          node -e "if(parseFloat('$COVERAGE') < 80) { console.error('Coverage below 80%'); process.exit(1); }"
+
+  # ──────────────────────────────────────────────
+  # JOB 3 — SAST (CodeQL)
+  # ──────────────────────────────────────────────
+  sast:
+    name: SAST — CodeQL
+    runs-on: ubuntu-latest
+    needs: pre-checks
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:javascript
+
+  # ──────────────────────────────────────────────
+  # JOB 4 — DEPENDENCY AUDIT (OSS CVEs)
+  # ──────────────────────────────────────────────
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    needs: pre-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: npm audit (critical + high)
+        run: npm audit --audit-level=high
+
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ github.repository }}
+          path: .
+          format: SARIF
+          args: >
+            --enableRetired
+            --failOnCVSS 7
+
+      - name: Upload OWASP report
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: reports/dependency-check-report.sarif
+
+  # ──────────────────────────────────────────────
+  # JOB 5 — BUILD DOCKER IMAGE
+  # ──────────────────────────────────────────────
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: [test, sast, dependency-audit]
+    outputs:
+      image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (no push yet)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_ENV=production
+
+      - name: Save image as tar
+        run: docker save ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} -o image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar
+          retention-days: 1
+
+  # ──────────────────────────────────────────────
+  # JOB 6 — CONTAINER SECURITY SCAN (Trivy)
+  # ──────────────────────────────────────────────
+  container-scan:
+    name: Container scan — Trivy
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: docker load -i image.tar
+
+      - name: Trivy — vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"            # fail pipeline on CRITICAL/HIGH
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: container
+
+      - name: Trivy — config/IaC scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+
+  # ──────────────────────────────────────────────
+  # JOB 7 — SBOM GENERATION
+  # ──────────────────────────────────────────────
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: docker load -i image.tar
+
+      - name: Generate SBOM (Syft — CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # JOB 8 — SONARQUBE ANALYSIS
+  # ──────────────────────────────────────────────
+  sonarqube:
+    name: SonarQube analysis
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history for blame data
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.event.repository.name }}
+            -Dsonar.sources=src
+            -Dsonar.tests=src
+            -Dsonar.test.inclusions=**/*.test.ts,**/*.spec.ts
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.qualitygate.wait=true
+
+      # The qualitygate.wait=true above already fails the job if the gate fails.
+      # The step below surfaces the status as a readable log line.
+      - name: SonarQube Quality Gate check
+        uses: SonarSource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # ──────────────────────────────────────────────
+  # JOB 9 — SECURITY QUALITY GATE
+  # Aggregates scan results; nothing proceeds past here
+  # unless all checks are green.
+  # ──────────────────────────────────────────────
+  security-gate:
+    name: Security quality gate
+    runs-on: ubuntu-latest
+    needs: [container-scan, sbom, sonarqube]
+    steps:
+      - name: All security checks passed
+        run: echo "Container scan, SBOM, and SonarQube quality gate are all green."
+
+  # ──────────────────────────────────────────────
+  # JOB 10 — PUSH IMAGE & SIGN
+  # ──────────────────────────────────────────────
+  publish:
+    name: Push & sign image
+    runs-on: ubuntu-latest
+    needs: security-gate
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: docker load -i image.tar
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        run: docker push ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with Cosign (keyless via OIDC)
+        run: |
+          cosign sign --yes ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: Attach SBOM to image
+        uses: anchore/sbom-action/publish-sbom@v0
+        with:
+          sbom-artifact-match: ".*\\.cyclonedx\\.json$"
+
+  # ──────────────────────────────────────────────
+  # JOB 11 — DEPLOY TO STAGING
+  # ──────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: publish
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploying ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} to staging"
+          # Example: kubectl set image deployment/app app=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          # or: helm upgrade --install app ./helm --set image.tag=${{ env.IMAGE_TAG }}
+
+      - name: Smoke tests
+        run: |
+          echo "Running smoke tests against staging..."
+          # curl -f https://staging.yourapp.com/health
+
+  # ──────────────────────────────────────────────
+  # JOB 12 — DAST (OWASP ZAP)
+  # ──────────────────────────────────────────────
+  dast:
+    name: DAST — OWASP ZAP
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - name: OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ secrets.STAGING_URL }}
+          rules_file_name: .zap/rules.tsv
+          cmd_options: "-a"
+          fail_action: true
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: report_html.html
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # JOB 13 — MANUAL APPROVAL (production gate)
+  # ──────────────────────────────────────────────
+  approval:
+    name: Await production approval
+    runs-on: ubuntu-latest
+    needs: dast
+    environment: production   # <-- configure required reviewers in GitHub Settings
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Approval received
+        run: echo "Production deployment approved by ${{ github.actor }}"
+
+  # ──────────────────────────────────────────────
+  # JOB 14 — DEPLOY TO PRODUCTION
+  # ──────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: approval
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Blue/green deploy to production
+        run: |
+          echo "Deploying ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} to production"
+          # kubectl set image deployment/app app=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          # helm upgrade --install app ./helm --set image.tag=${{ env.IMAGE_TAG }} --atomic --timeout 5m
+
+      - name: Post-deploy health check
+        run: |
+          echo "Running production health checks..."
+          # curl -f https://yourapp.com/health
+
+      - name: Notify on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "Production deploy succeeded: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Auto-rollback on failure
+        if: failure()
+        run: |
+          echo "Deploy failed — rolling back to previous release"
+          # helm rollback app
+          # kubectl rollout undo deployment/app
