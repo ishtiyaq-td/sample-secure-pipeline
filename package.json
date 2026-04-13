@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node app.js",
     "dev": "nodemon app.js",
-    "lint": "eslint src/ app.js",
+    "lint": "eslint . --ext .js --ignore-pattern node_modules/ --env es2021,node --parser-options ecmaVersion:2021",
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
     "test": "jest",
